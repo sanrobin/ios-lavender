@@ -116,7 +116,7 @@ index ccbb188..777aca4 100644
  	// Set low reset vector before attempting any loads
  	adrp	x0, EXT(LowExceptionVectorBase)@page
  	add		x0, x0, EXT(LowExceptionVectorBase)@pageoff
-@@ -609,6 +628,30 @@ Lkernelcache_base_found:
+@@ -609,6 +628,31 @@ Lkernelcache_base_found:
  	lsr		x5,  x24, #(ARM_TT_L2_SHIFT)
  	create_bootstrap_mapping x14, x15, x5, x3, x2, x9, x10, x11, x12, x13
  
@@ -128,7 +128,8 @@ index ccbb188..777aca4 100644
 +	 */
 +	add		x13, x25, #(3 * PGBYTES)
 +	orr		x10, x13, #0x3
-+	add		x11, x25, #(PGBYTES + 2 * 8)
++	add		x11, x25, #1, lsl #12
++	add		x11, x11, #(2 * 8)
 +	str		x10, [x11]
 +	MOV64	x10, 0x9d400000
 +	MOV64	x11, (ARM_TTE_TYPE_BLOCK | ARM_TTE_VALID | ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) | ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) | ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX)
