@@ -96,7 +96,7 @@ index ccbb188..777aca4 100644
  
 +#if defined(SWEET)
 +	/* Stage 0: white 64x32 band, no stack or page tables needed. */
-+	MOV64	x0, (0x9d400000 + 2368 * 4320)
++	MOV64	x0, (0x9d400000 + 2280 * 4320)
 +	mov		w1, #-1
 +	mov		x2, #32
 +	mov		x4, #4320
@@ -116,17 +116,14 @@ index ccbb188..777aca4 100644
  	// Set low reset vector before attempting any loads
  	adrp	x0, EXT(LowExceptionVectorBase)@page
  	add		x0, x0, EXT(LowExceptionVectorBase)@pageoff
-@@ -609,6 +628,23 @@ Lkernelcache_base_found:
+@@ -609,6 +628,29 @@ Lkernelcache_base_found:
  	lsr		x5,  x24, #(ARM_TT_L2_SHIFT)
  	create_bootstrap_mapping x14, x15, x5, x3, x2, x9, x10, x11, x12, x13
  
 +#if defined(SWEET)
 +	/*
-+	 * Splash framebuffer: one 32MB Normal-NC block in the EXISTING V=P
-+	 * L2 table. Both framebuffer and RAM use L1 index 0; another call to
-+	 * create_bootstrap_mapping would replace the RAM L2 table.
-+	 * SWEET uses 16K pages and all bring-up RAM is below 4GB, so the first
-+	 * V=P L2 page is bootstrap_pagetables + 2*PGBYTES.
++	 * Splash framebuffer: 6 x 2MB Normal-NC blocks in the EXISTING V=P
++	 * L2 table. In 4KB mode each L2 block is 2MB, so 6 blocks map 12MB.
 +	 */
 +	MOV64	x10, 0x9d400000
 +	MOV64	x11, (ARM_TTE_TYPE_BLOCK | ARM_TTE_VALID | ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) | ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) | ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX)
@@ -134,7 +131,13 @@ index ccbb188..777aca4 100644
 +	and		x12, x10, #(ARM_TT_L2_INDEX_MASK)
 +	lsr		x12, x12, #(ARM_TT_L2_SHIFT)
 +	add		x13, x25, #(2 * PGBYTES)
++	mov		x14, #6
++1:
 +	str		x11, [x13, x12, lsl #TTE_SHIFT]
++	add		x11, x11, #(ARM_TT_L2_SIZE)
++	add		x12, x12, #1
++	subs	x14, x14, #1
++	b.ne	1b
 +#endif
 +
  	/* Ensure TTEs are visible */
