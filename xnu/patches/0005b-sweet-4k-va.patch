@@ -25,3 +25,25 @@ diff --git a/osfmk/mach/arm/vm_param.h b/osfmk/mach/arm/vm_param.h
  #define MACH_VM_MAX_ADDRESS_RAW 0x00007FFFFE000000ULL
  #else
  #define MACH_VM_MAX_ADDRESS_RAW 0x0000000FC0000000ULL
+diff --git a/osfmk/arm64/proc_reg.h b/osfmk/arm64/proc_reg.h
+--- a/osfmk/arm64/proc_reg.h
++++ b/osfmk/arm64/proc_reg.h
+@@ -943,6 +943,10 @@
+  * the kernel.
+  */
+ #endif /* __ARM_KERNEL_PROTECT__ */
++#if defined(SWEET) || defined(ARM64_BOARD_CONFIG_SWEET)
++#define T0SZ_BOOT 16ULL
++#define T1SZ_BOOT 16ULL
++#else
+ #ifdef __ARM_16K_PG__
+ #if __ARM64_PMAP_SUBPAGE_L1__
+ #define T0SZ_BOOT 25ULL
+@@ -975,6 +979,7 @@
+ #endif /*__ARM64_PMAP_SUBPAGE_L1__*/
+ #endif /* __ARM_16K_PG__ */
+ #endif /* defined(APPLE_ARM64_ARCH_FAMILY) */
++#endif /* SWEET */
+ 
+ #if __ARM_42BIT_PA_SPACE__
+ #define TCR_IPS_VALUE TCR_IPS_42BITS

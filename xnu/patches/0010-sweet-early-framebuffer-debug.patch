@@ -77,7 +77,7 @@ index d89b0f1..d0c710d 100644
  #include <arm/cpu_data_internal.h>
  #include <arm/misc_protos.h>
  #include <pexpert/arm64/boot.h>
-@@ -2145,6 +2146,8 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+@@ -2145,6 +2146,8 @@ args)
  
  	ml_enable_monitor();
  
@@ -87,7 +87,6 @@ index d89b0f1..d0c710d 100644
  
  	flush_mmu_tlb();
 diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
-index ccbb188..777aca4 100644
 --- a/osfmk/arm64/start.s
 +++ b/osfmk/arm64/start.s
 @@ -463,6 +463,25 @@ LEXT(start_first_cpu)
@@ -116,7 +115,54 @@ index ccbb188..777aca4 100644
  	// Set low reset vector before attempting any loads
  	adrp	x0, EXT(LowExceptionVectorBase)@page
  	add		x0, x0, EXT(LowExceptionVectorBase)@pageoff
-@@ -609,6 +628,38 @@ Lkernelcache_base_found:
+@@ -547,7 +566,11 @@ LEXT(start_first_cpu)
+ 	mov		x0, #(ARM_TTE_EMPTY)				// Load invalid entry template
+ 	mov		x1, x25								// Start at V=P pagetable root
+ 	mov		x2, #(TTE_PGENTRIES)				// Load number of entries per page
++#if defined(SWEET)
++	lsl		x2, x2, #4							// Shift by 4 for num entries on 16 pages
++#else
+ 	lsl		x2, x2, #2							// Shift by 2 for num entries on 4 pages
++#endif
+ 
+ Linvalidate_bootstrap:							// do {
+ 	str		x0, [x1], #(1 << TTE_SHIFT)			//   Invalidate and advance
+@@ -613,9 +636,34 @@
+ 	 * slide, we need 1xL1 and up to 3xL2 pages (1GB mapped per L1 entry), so
+ 	 * 8 total pages for V=P and KVA.
+ 	 */
++#if defined(SWEET)
++	/*
++	 * 4KB mode with 48-bit VA (T0SZ=16, T1SZ=16):
++	 * TTBR0 and TTBR1 start at Level 0 (512 entries).
++	 * Page 0 (x25 + 0*PGBYTES): TTBR0 Level 0 root table.
++	 * Page 1 (x25 + 1*PGBYTES): TTBR1 Level 0 root table.
++	 * Page 2 (x25 + 2*PGBYTES): TTBR0 Level 1 table.
++	 * Page 3 (x25 + 3*PGBYTES): TTBR1 Level 1 table.
++	 * Page 4+: variable L2 tables allocated by create_bootstrap_mapping.
++	 */
++	add		x10, x25, #2, lsl #12
++	orr		x10, x10, #0x3
++	str		x10, [x25, #(0 * 8)]
++
++	add		x10, x25, #3, lsl #12
++	orr		x10, x10, #0x3
++	add		x11, x25, #1, lsl #12
++	mov		x12, #508
++	str		x10, [x11, x12, lsl #3]
++
++	add		x1, x25, #2, lsl #12
++	add		x3, x25, #3, lsl #12
++	mov		x2, x3
++#else
+ 	mov		x1, x25
+ 	add		x3, x1, PGBYTES
+ 	mov		x2, x3
++#endif
+ 
+ 	/*
+ 	 * Setup the V=P bootstrap mapping
+@@ -647,5 +698,40 @@
  	lsr		x5,  x24, #(ARM_TT_L2_SHIFT)
  	create_bootstrap_mapping x14, x15, x5, x3, x2, x9, x10, x11, x12, x13
  
@@ -124,10 +170,11 @@ index ccbb188..777aca4 100644
 +	/*
 +	 * Splash framebuffer: 6 x 2MB Normal-NC blocks in a dedicated L2 table.
 +	 * In 4KB mode each L2 block is 2MB, so 6 blocks map 12MB.
-+	 * RAM (0x100000000) uses TTBR0 L1 entry 4; the framebuffer (0x9d400000)
-+	 * uses TTBR0 L1 entry 2 (0x80000000..0xBFFFFFFF).
++	 * RAM (0x100000000) uses TTBR0 Level 1 entry 4; the framebuffer (0x9d400000)
++	 * uses TTBR0 Level 1 entry 2 (0x80000000..0xBFFFFFFF).
 +	 * Allocate next free page x13 from _bootstrap_pagetables (after x2),
 +	 * clear it, link TTBR0 L1 entry 2 to it, and map the 6 FB blocks.
++	 * Note: TTBR0 Level 1 table is Page 2 (x25 + 2*PGBYTES).
 +	 */
 +	add		x13, x2, #1, lsl #12
 +	mov		x14, #512
@@ -137,7 +184,8 @@ index ccbb188..777aca4 100644
 +	subs	x14, x14, #1
 +	b.ne	1b
 +	orr		x10, x13, #0x3
-+	str		x10, [x25, #(2 * 8)]
++	add		x15, x25, #2, lsl #12
++	str		x10, [x15, #(2 * 8)]
 +	MOV64	x10, 0x9d400000
 +	MOV64	x11, (ARM_TTE_TYPE_BLOCK | ARM_TTE_VALID | ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) | ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) | ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX)
 +	orr		x11, x11, x10
@@ -150,11 +198,11 @@ index ccbb188..777aca4 100644
 +	add		x12, x12, #1
 +	subs	x14, x14, #1
 +	b.ne	2b
++	mov		x2, x13
 +#endif
 +
  	/* Ensure TTEs are visible */
  	dsb		ish
- 
 diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
 new file mode 100644
 index 0000000..8f4c808
@@ -323,7 +371,7 @@ diff --git a/osfmk/conf/files.arm64 b/osfmk/conf/files.arm64
 index c40d57b..b0dad49 100644
 --- a/osfmk/conf/files.arm64
 +++ b/osfmk/conf/files.arm64
-@@ -40,6 +40,7 @@ osfmk/arm64/dbgwrap.c		standard
+@@ -40,6 +40,7 @@ standard
  osfmk/arm/arm_timer.c		standard
  osfmk/arm/arm_init.c	optional config_pmap_ppl
  osfmk/arm64/arm_vm_init.c	optional config_pmap_ppl
@@ -345,7 +393,7 @@ index 0a00656..437adb1 100644
  #include <IOKit/IOBSD.h>
  
  #if !(MACH_KDP && CONFIG_KDP_INTERACTIVE_DEBUGGING)
-@@ -1069,6 +1072,11 @@ panic_trap_to_debugger(const char *panic_format_str, va_list *panic_args, unsign
+@@ -1069,6 +1072,11 @@ unsign
  {
  #pragma clang diagnostic pop
  
