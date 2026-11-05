@@ -1,27 +1,7 @@
 diff --git a/osfmk/arm/pmap/pmap.c b/osfmk/arm/pmap/pmap.c
 --- a/osfmk/arm/pmap/pmap.c
 +++ b/osfmk/arm/pmap/pmap.c
-@@ -412,4 +412,8 @@
- 
- SECURITY_READ_ONLY_LATE(tt_entry_t *) cpu_tte  = 0;                     /* set by arm_vm_init() - keep out of bss */
- SECURITY_READ_ONLY_LATE(pmap_paddr_t) cpu_ttep = 0;                     /* set by arm_vm_init() - phys tte addr */
-+#if defined(SWEET) || defined(ARM64_BOARD_CONFIG_SWEET)
-+SECURITY_READ_ONLY_LATE(tt_entry_t *) cpu_l0_tte  = 0;
-+SECURITY_READ_ONLY_LATE(pmap_paddr_t) cpu_l0_ttep = 0;
-+#endif
- 
-@@ -2128,5 +2132,10 @@
- #if HAS_APPLE_PAC
- 	kernel_pmap->disable_jop = 0;
- #endif /* HAS_APPLE_PAC */
-+#if defined(SWEET) || defined(ARM64_BOARD_CONFIG_SWEET)
-+	kernel_pmap->tte = cpu_l0_tte;
-+	kernel_pmap->ttep = cpu_l0_ttep;
-+#else
- 	kernel_pmap->tte = cpu_tte;
- 	kernel_pmap->ttep = cpu_ttep;
-+#endif
-@@ -10985,7 +10994,9 @@ static_assert((_COMM_PAGE32_BASE_ADDRESS & ~ARM_TT_L2_OFFMASK) >= VM_MAX_ADDRESS
+@@ -10985,7 +10985,9 @@ static_assert((_COMM_PAGE32_BASE_ADDRESS & ~ARM_TT_L2_OFFMASK) >= VM_MAX_ADDRESS
   * Ensure that 64-bit devices using 4K pages can nest the commpage completely
   * above the maximum userspace VA.
   */
@@ -45,15 +25,6 @@ diff --git a/osfmk/mach/arm/vm_param.h b/osfmk/mach/arm/vm_param.h
  #define MACH_VM_MAX_ADDRESS_RAW 0x00007FFFFE000000ULL
  #else
  #define MACH_VM_MAX_ADDRESS_RAW 0x0000000FC0000000ULL
-@@ -207,4 +209,8 @@
- #define VM_MIN_KERNEL_ADDRESS   ((vm_address_t) (0ULL - TiB(2)))
- 
- // 1.25TB for static_memory_region, 512GB for kernel heap, 256GB for KASAN
-+#if defined(SWEET) || defined(ARM64_BOARD_CONFIG_SWEET)
-+#define VM_MAX_KERNEL_ADDRESS   ((vm_address_t) (VM_MIN_KERNEL_ADDRESS + GiB(506) - 1))
-+#else
- #define VM_MAX_KERNEL_ADDRESS   ((vm_address_t) (VM_MIN_KERNEL_ADDRESS + GiB(64) + GiB(512) - 1))
-+#endif
 diff --git a/osfmk/arm64/proc_reg.h b/osfmk/arm64/proc_reg.h
 --- a/osfmk/arm64/proc_reg.h
 +++ b/osfmk/arm64/proc_reg.h

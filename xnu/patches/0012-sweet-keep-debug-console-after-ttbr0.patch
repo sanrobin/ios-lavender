@@ -1,13 +1,17 @@
 diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
 --- a/osfmk/arm64/arm_vm_init.c
 +++ b/osfmk/arm64/arm_vm_init.c
-@@ -1825,6 +1825,49 @@
+@@ -1825,6 +1825,53 @@
  #define ARM64_PHYSMAP_ALIGNMENT_PADDING (PTOV_TABLE_SIZE * ARM_TT_TWIG_SIZE)
  #endif
  
 +#if defined(SWEET)
-+extern tt_entry_t *cpu_l0_tte;
-+extern pmap_paddr_t cpu_l0_ttep;
++SECURITY_READ_ONLY_LATE(static tt_entry_t *) cpu_l0_tte = NULL;
++SECURITY_READ_ONLY_LATE(static pmap_paddr_t) cpu_l0_ttep = 0;
++struct sweet_pmap_root {
++	tt_entry_t *tte;
++	pmap_paddr_t ttep;
++};
 +
 +/*
 + * The reserved low-globals/kernel region is excluded from VM allocation.
@@ -51,7 +55,7 @@ diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
  void
  arm_vm_init(uint64_t memory_size, boot_args * args)
  {
-@@ -2153,20 +2195,35 @@
+@@ -2153,20 +2200,35 @@
  
  	arm_set_user_tbi();
  
@@ -89,17 +93,22 @@ diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
  
  	// From here on out, we're off the bootstrap translation tables.
  
-@@ -2259,7 +2293,9 @@
+@@ -2259,7 +2321,14 @@
      }
  #endif
  #endif
 +	sweet_early_mark(12, "calling pmap_bootstrap");
  	pmap_bootstrap(dynamic_memory_begin);
++#if defined(SWEET)
++	/* Bind kernel_pmap to Level 0 root table for 4KB granule 48-bit VA */
++	((struct sweet_pmap_root *)kernel_pmap)->tte = cpu_l0_tte;
++	((struct sweet_pmap_root *)kernel_pmap)->ttep = cpu_l0_ttep;
++#endif
 +	sweet_early_mark(13, "pmap_bootstrap done");
  
  	disable_preemption();
  
-@@ -2310,6 +2346,7 @@
+@@ -2310,6 +2380,7 @@
  		va_l1 = va_l2_end;
  		cpu_l1_tte++;
  	}
@@ -159,7 +168,7 @@ diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
 @@ -121,9 +126,17 @@
  }
  
- void
++void
 +sweet_early_relocate(uint64_t base)
 +{
 +	sweet_early_mark(8, "leaving bootstrap TTBR0");
@@ -168,7 +177,7 @@ diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
 +	sweet_early_mark(9, "kernel framebuffer VA live");
 +}
 +
-+void
+ void
  sweet_early_disable(void)
  {
 -	sweet_early_mark(8, "leaving bootstrap TTBR0");
