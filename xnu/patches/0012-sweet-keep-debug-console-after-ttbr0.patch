@@ -1,11 +1,14 @@
 diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
 --- a/osfmk/arm64/arm_vm_init.c
 +++ b/osfmk/arm64/arm_vm_init.c
-@@ -1825,6 +1825,34 @@
+@@ -1825,6 +1825,49 @@
  #define ARM64_PHYSMAP_ALIGNMENT_PADDING (PTOV_TABLE_SIZE * ARM_TT_TWIG_SIZE)
  #endif
  
 +#if defined(SWEET)
++extern tt_entry_t *cpu_l0_tte;
++extern pmap_paddr_t cpu_l0_ttep;
++
 +/*
 + * The reserved low-globals/kernel region is excluded from VM allocation.
 + * Use the otherwise empty 32MB block above low globals and below gVirtBase
@@ -30,13 +33,25 @@ diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
 +		    ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX;
 +	}
 +	__asm__ volatile("dsb ishst" ::: "memory");
++
++	/*
++	 * In 4KB granule mode with 48-bit VA, hardware MMU begins at Level 0.
++	 * Allocate a dedicated Level 0 root table for TTBR1 and link entries
++	 * 507 (physmap) and 508 (kernel VA space) to the Level 1 table cpu_ttep.
++	 */
++	cpu_l0_tte = (tt_entry_t *)alloc_ptpage(TRUE);
++	cpu_l0_ttep = kvtophys((vm_offset_t)cpu_l0_tte);
++	bzero(cpu_l0_tte, ARM_PGBYTES);
++	cpu_l0_tte[507] = (cpu_ttep & ARM_TTE_TABLE_MASK) | ARM_TTE_TYPE_TABLE | ARM_TTE_VALID;
++	cpu_l0_tte[508] = (cpu_ttep & ARM_TTE_TABLE_MASK) | ARM_TTE_TYPE_TABLE | ARM_TTE_VALID;
++	__asm__ volatile("dsb ishst" ::: "memory");
 +}
 +#endif
 +
  void
  arm_vm_init(uint64_t memory_size, boot_args * args)
  {
-@@ -2153,20 +2179,28 @@
+@@ -2153,20 +2195,35 @@
  
  	arm_set_user_tbi();
  
@@ -45,7 +60,11 @@ diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
 +	sweet_early_map_final();
 +#endif
  	arm_vm_physmap_init(args);
++#if defined(SWEET)
++	set_mmu_ttb_alternate(cpu_l0_ttep & TTBR_BADDR_MASK);
++#else
  	set_mmu_ttb_alternate(cpu_ttep & TTBR_BADDR_MASK);
++#endif
  
  	ml_enable_monitor();
  
@@ -63,6 +82,9 @@ diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
  	// global table pointers may need to be different due to physical aperture remapping
  	cpu_tte = (tt_entry_t*)(phystokv(cpu_ttep));
  	invalid_tte = (tt_entry_t*)(phystokv(invalid_ttep));
++#if defined(SWEET)
++	cpu_l0_tte = (tt_entry_t*)(phystokv(cpu_l0_ttep));
++#endif
 +	sweet_early_mark(11, "physmap table pointers rebound");
  
  	// From here on out, we're off the bootstrap translation tables.
