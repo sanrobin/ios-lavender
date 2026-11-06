@@ -1,0 +1,140 @@
+--- a/osfmk/arm/cpu_common.c
++++ b/osfmk/arm/cpu_common.c
+@@ -976,6 +976,17 @@
+ 	cpu_data_t *cdp = CpuDataEntries[cpu].cpu_data_vaddr;
+ 	return cdp != NULL && !(os_atomic_load(&cdp->cpu_signal, acquire) & SIGPdisabled);
+ }
++
++void sweet_cpu_signal_enable(unsigned int cpu);
++void
++sweet_cpu_signal_enable(unsigned int cpu)
++{
++	if (cpu < MAX_CPUS) {
++		cpu_data_t *cdp = CpuDataEntries[cpu].cpu_data_vaddr;
++		if (cdp != NULL) {
++			os_atomic_and(&cdp->cpu_signal, ~SIGPdisabled, release);
++		}
++	}
+ }
+ #endif
+ 
+ 
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -20,6 +20,7 @@
+ #include <mach/mach_time.h>
+ 
+ extern "C" boolean_t sweet_cpu_signal_is_enabled(unsigned int cpu);
++extern "C" void sweet_cpu_signal_enable(unsigned int cpu);
+ 
+ class SweetCPU;
+ static SweetCPU *sweet_cpus[MAX_CPUS];
+@@ -128,8 +129,8 @@
+ 	const ml_topology_info_t *topology = ml_get_topology_info();
+ 	uint32_t requested = 1;
+ 	PE_parse_boot_argn("cpus", &requested, sizeof(requested));
+-	IOLog("SWEET CPU: requested=%u selected=%u (limit=%u)\n",
+-	    requested, topology->num_cpus, SWEET_SMP_MAX_CPUS);
++	kprintf("SWEET CPU: requested=%u selected=%u (limit=%u)\n",
++	    requested, topology->num_cpus, SWEET_SMP_MAX_CPUS);
+ 
+ 	uint64_t deadline;
+ 	nanoseconds_to_deadline(10 * NSEC_PER_SEC, &deadline);
+@@ -137,11 +138,11 @@
+ 		if (mach_absolute_time() > deadline) {
+ 			for (unsigned int i = 0; i < topology->num_cpus; i++) {
+ 				if (__atomic_load_n(&sweet_cpus[i], __ATOMIC_ACQUIRE) == NULL) {
+-					IOLog("SWEET CPU: cpu=%u NOT registered (IOKit matching timeout)\n", i);
++					kprintf("SWEET CPU: cpu=%u NOT registered (IOKit matching timeout)\n", i);
+ 				}
+ 			}
+ 			panic("SWEET CPU: CPU registration timeout");
+ 		}
+-		IOSleep(1);
++		IODelay(100);
+ 	}
+ 	/* The supplied ADT has cpu0 as the boot CPU and ascending A55 nodes. */
+@@ -152,23 +153,28 @@
+ 		SweetCPU *cpu = __atomic_load_n(&sweet_cpus[i], __ATOMIC_ACQUIRE);
+ 		kern_return_t kr = processor_start(cpu->machProcessor);
+ 		if (kr != KERN_SUCCESS) {
+ 			panic("SWEET CPU: cpu=%u processor_start failed: %d", i, kr);
+ 		}
++		kprintf("SWEET CPU: cpu=%u processor_start ok (kr=%d)\n", i, kr);
++		if (i == 0) {
++			sweet_cpu_signal_enable(0);
++		}
+ 		/* processor_start() is asynchronous for secondaries in this XNU. */
+ 		nanoseconds_to_deadline(5 * NSEC_PER_SEC, &deadline);
+ 		while (__atomic_load_n(&cpu->initialized, __ATOMIC_ACQUIRE) == 0 ||
+ 		    !sweet_cpu_signal_is_enabled(i)) {
+ 			if (mach_absolute_time() > deadline) {
+-				IOLog("SWEET CPU: cpu=%u mpidr=0x%x NOT alive after 5s\n",
+-				    i, topology->cpus[i].phys_id);
++				kprintf("SWEET CPU: cpu=%u mpidr=0x%x NOT alive after 5s\n",
++				    i, topology->cpus[i].phys_id);
+ 				panic("SWEET CPU: cpu=%u startup timeout (reset/MMU/GIC/SGI)", i);
+ 			}
+-			IOSleep(1);
++			IODelay(100);
+ 		}
+-		IOLog("SWEET CPU: cpu=%u mpidr=0x%x came alive; SGI1 OK\n",
++		kprintf("SWEET CPU: cpu=%u mpidr=0x%x came alive; SGI1 OK\n",
+ 		    i, topology->cpus[i].phys_id);
+ 	}
+ 	/* Publish exactly once, after every selected CPU has completed initCPU(). */
+ 	ml_cpu_init_completed();
+ 	__atomic_load_n(&sweet_cpus[topology->boot_cpu->cpu_id], __ATOMIC_ACQUIRE)->cpusRunning();
++	kprintf("SWEET CPU: publishing gIOAllCPUInitializedKey\n");
+ 	IOService::publishResource(gIOAllCPUInitializedKey, kOSBooleanTrue);
+ 	ml_set_max_cpus(topology->max_cpu_id + 1);
+-	IOLog("SWEET CPU: %u/%u CPUs initialized, SGI1 verified\n",
++	kprintf("SWEET CPU: %u/%u CPUs initialized, SGI1 verified\n",
+ 	    topology->num_cpus, topology->num_cpus);
+ 	thread_terminate(current_thread());
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -771,11 +771,13 @@
+ //
+ 	if (strcmp(rdBootVar, "ufsroot0") == 0) {
+ 		extern int sweet_ufs_rootdev(dev_t *dev);
++		kprintf("IOFindBSDRoot: searching for root on %s...\n", rdBootVar);
+ 		OSSafeReleaseNULL(matching);
+ 		int ufs_error = sweet_ufs_rootdev(root);
+ 		if (ufs_error) {
+ 			panic("IOFindBSDRoot: SWEET UFS root %s unavailable: %d", rdBootVar, ufs_error);
+ 		}
+ 		strlcpy(rootName, rdBootVar, rootNameSize);
+-		IOLog("BSD root: %s, major %d, minor %d\n", rootName, major(*root), minor(*root));
++		kprintf("IOFindBSDRoot: root mounted %s, major %d, minor %d\n", rootName, major(*root), minor(*root));
+ 		*oflags = 0;
+ 		goto iofrootx;
+ 	}
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -883,8 +883,8 @@
+ 	/* Only now, with the partition bounds known, can writes be allowed. */
+ 	su.writable = (rw != 0);
+ 	su.ready = true;
+ 	uint32_t dev_blk = su.is_emmc ? 512u : UFS_BLOCK;
+-	printf("SWEET %s: \"%s\": first block 0x%llx, %llu MiB, %s, DMA at 0x%llx\n",
++	kprintf("SWEET %s: \"%s\": first block 0x%llx, %llu MiB, %s, DMA at 0x%llx\n",
+ 	    su.is_emmc ? "eMMC" : "UFS", want, su.first_block, su.nblocks * dev_blk >> 20,
+ 	    su.writable ? "read-write" : "read-only", su.dma_pa);
+ 	sweet_log_start();
+@@ -908,10 +908,13 @@
+ int
+ sweet_ufs_rootdev(dev_t *dev)
+ {
++	kprintf("SWEET STORAGE: sweet_ufs_rootdev called\n");
+ 	if (!su.ready) {
+ 		int error = sweet_ufs_init();
+ 		if (error) {
++			kprintf("SWEET STORAGE: sweet_ufs_init failed: %d\n", error);
+ 			return error;
+ 		}
+ 	}
+ 	*dev = su.bdev;
++	kprintf("SWEET STORAGE: sweet_ufs_rootdev ready dev=0x%x\n", *dev);
+ 	return 0;
+ }
