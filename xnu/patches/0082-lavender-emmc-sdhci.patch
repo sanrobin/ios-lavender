@@ -11,11 +11,10 @@
  	bool writable;                          /* boot-arg ufsrw=1 */
  	bool cache;                             /* boot-arg ufscache=1 */
  	bool wait;                              /* boot-arg ufswait=1 */
-@@ -299,16 +300,232 @@
+@@ -299,16 +300,243 @@
  	return ufs_scsi(cdb, sizeof(cdb), 0, false);
  }
  
-+
 +#define SDHC_BLOCK_SIZE     0x04
 +#define SDHC_BLOCK_COUNT    0x06
 +#define SDHC_ARGUMENT       0x08
@@ -29,8 +28,9 @@
 +struct adma2_desc {
 +	uint16_t cmd;
 +	uint16_t len;
-+	uint32_t addr;
-+} __attribute__((packed, aligned(8)));
++	uint32_t addr_lo;
++	uint32_t addr_hi;
++} __attribute__((packed, aligned(4)));
 +
 +static inline uint32_t sdhc_rd(uint32_t off) {
 +	return *(volatile uint32_t *)(su.regs + off);
@@ -55,19 +55,21 @@
 +	deadline += mach_absolute_time();
 +	while (sdhc_rd(SDHC_PRESENT_STATE) & 3) {
 +		if (mach_absolute_time() > deadline) {
-+			printf("LAVENDER eMMC: command inhibit timeout\n");
++			kprintf("LAVENDER eMMC: command inhibit timeout\n");
 +			return ETIMEDOUT;
 +		}
 +		delay(1);
 +	}
 +
 +	uint32_t hctl = sdhc_rd(SDHC_HOST_CONTROL_1);
-+	hctl = (hctl & ~0x18) | 0x10;
++	hctl = (hctl & ~0x18) | 0x18;
 +	sdhc_wr(SDHC_HOST_CONTROL_1, hctl);
 +
++	memset(desc, 0, sizeof(*desc));
 +	desc->cmd = 0x0023;
 +	desc->len = (uint16_t)bytes;
-+	desc->addr = (uint32_t)bounce_pa;
++	desc->addr_lo = (uint32_t)bounce_pa;
++	desc->addr_hi = (uint32_t)(bounce_pa >> 32);
 +
 +	dma_sync(DMA_UTRL, sizeof(*desc));
 +	dma_sync(DMA_BOUNCE, bytes);
@@ -75,6 +77,7 @@
 +
 +	sdhc_wr(SDHC_INT_STATUS, 0xffffffff);
 +	sdhc_wr(SDHC_ADMA_ADDR, (uint32_t)desc_pa);
++	sdhc_wr(SDHC_ADMA_ADDR + 4, (uint32_t)(desc_pa >> 32));
 +	sdhc_wr16(SDHC_BLOCK_SIZE, 512);
 +	sdhc_wr16(SDHC_BLOCK_COUNT, (uint16_t)count);
 +	sdhc_wr(SDHC_ARGUMENT, (uint32_t)lba);
@@ -97,12 +100,12 @@
 +		}
 +		if (istat & 0x8000) {
 +			sdhc_wr(SDHC_INT_STATUS, 0xffffffff);
-+			printf("LAVENDER eMMC: read error istat 0x%08x\n", istat);
++			kprintf("LAVENDER eMMC: read error istat 0x%08x LBA 0x%llx count %u\n", istat, lba, count);
 +			return EIO;
 +		}
 +		if (mach_absolute_time() > deadline) {
 +			sdhc_wr(SDHC_INT_STATUS, 0xffffffff);
-+			printf("LAVENDER eMMC: read timeout LBA 0x%llx count %u istat 0x%x\n", lba, count, istat);
++			kprintf("LAVENDER eMMC: read timeout LBA 0x%llx count %u istat 0x%x\n", lba, count, istat);
 +			return ETIMEDOUT;
 +		}
 +		delay(1);
@@ -142,18 +145,21 @@
 +	deadline += mach_absolute_time();
 +	while (sdhc_rd(SDHC_PRESENT_STATE) & 3) {
 +		if (mach_absolute_time() > deadline) {
++			kprintf("LAVENDER eMMC: write inhibit timeout\n");
 +			return ETIMEDOUT;
 +		}
 +		delay(1);
 +	}
 +
 +	uint32_t hctl = sdhc_rd(SDHC_HOST_CONTROL_1);
-+	hctl = (hctl & ~0x18) | 0x10;
++	hctl = (hctl & ~0x18) | 0x18;
 +	sdhc_wr(SDHC_HOST_CONTROL_1, hctl);
 +
++	memset(desc, 0, sizeof(*desc));
 +	desc->cmd = 0x0023;
 +	desc->len = (uint16_t)bytes;
-+	desc->addr = (uint32_t)bounce_pa;
++	desc->addr_lo = (uint32_t)bounce_pa;
++	desc->addr_hi = (uint32_t)(bounce_pa >> 32);
 +
 +	dma_clean(DMA_UTRL, sizeof(*desc));
 +	dma_clean(DMA_BOUNCE, bytes);
@@ -161,6 +167,7 @@
 +
 +	sdhc_wr(SDHC_INT_STATUS, 0xffffffff);
 +	sdhc_wr(SDHC_ADMA_ADDR, (uint32_t)desc_pa);
++	sdhc_wr(SDHC_ADMA_ADDR + 4, (uint32_t)(desc_pa >> 32));
 +	sdhc_wr16(SDHC_BLOCK_SIZE, 512);
 +	sdhc_wr16(SDHC_BLOCK_COUNT, (uint16_t)count);
 +	sdhc_wr(SDHC_ARGUMENT, (uint32_t)lba);
@@ -183,10 +190,12 @@
 +		}
 +		if (istat & 0x8000) {
 +			sdhc_wr(SDHC_INT_STATUS, 0xffffffff);
++			kprintf("LAVENDER eMMC: write error istat 0x%08x LBA 0x%llx count %u\n", istat, lba, count);
 +			return EIO;
 +		}
 +		if (mach_absolute_time() > deadline) {
 +			sdhc_wr(SDHC_INT_STATUS, 0xffffffff);
++			kprintf("LAVENDER eMMC: write timeout LBA 0x%llx count %u istat 0x%x\n", lba, count, istat);
 +			return ETIMEDOUT;
 +		}
 +		delay(1);
@@ -201,7 +210,7 @@
 +	if (!su.writable || !su.nblocks || count == 0 || count * 512 > BOUNCE_SIZE ||
 +	    lba < su.first_block || lba - su.first_block >= su.nblocks ||
 +	    count > su.nblocks - (lba - su.first_block) || lba + count - 1 > UINT32_MAX) {
-+		printf("LAVENDER eMMC: refusing write of %u blocks at 0x%llx\n", count, lba);
++		kprintf("LAVENDER eMMC: refusing write of %u blocks at 0x%llx\n", count, lba);
 +		return EPERM;
 +	}
 +	for (uint32_t done = 0; done < count;) {
@@ -236,30 +245,33 @@
 +	uint32_t dev_blk = su.is_emmc ? 512u : UFS_BLOCK;
  	const uint8_t *b = (const uint8_t *)(su.dma + DMA_BOUNCE);
 -	int error = ufs_read_blocks(1, 1);
++	kprintf("SWEET STORAGE: reading GPT via %s...\n", su.is_emmc ? "64-bit ADMA2 eMMC" : "UFS");
 +	int error = dev_read_blocks(1, 1);
  	if (error) {
++		kprintf("SWEET STORAGE: read LBA 1 failed: %d\n", error);
  		return error;
  	}
  	if (memcmp(b, "EFI PART", 8) != 0) {
 -		printf("SWEET UFS: LUN %u has no GPT\n", su.lun);
-+		printf("SWEET STORAGE: disk has no GPT\n");
++		kprintf("SWEET STORAGE: disk has no GPT\n");
  		return ENXIO;
  	}
  	uint64_t entry_lba;
-@@ -317,10 +534,10 @@
+@@ -317,10 +545,11 @@
  	memcpy(&nent, b + 80, 4);
  	memcpy(&esz, b + 84, 4);
  	if (esz != 128 || nent == 0 || nent * esz > BOUNCE_SIZE) {
 -		printf("SWEET UFS: unsupported GPT entries %u x %u\n", nent, esz);
-+		printf("SWEET STORAGE: unsupported GPT entries %u x %u\n", nent, esz);
++		kprintf("SWEET STORAGE: unsupported GPT entries %u x %u\n", nent, esz);
  		return ENXIO;
  	}
 -	error = ufs_read_blocks(entry_lba, (nent * esz + UFS_BLOCK - 1) / UFS_BLOCK);
++	kprintf("SWEET STORAGE: GPT valid, %u entries at LBA 0x%llx\n", nent, entry_lba);
 +	error = dev_read_blocks(entry_lba, (nent * esz + dev_blk - 1) / dev_blk);
  	if (error) {
  		return error;
  	}
-@@ -407,9 +624,10 @@
+@@ -407,9 +636,10 @@
  {
  	int error = 0;
  	caddr_t vaddr = NULL;
@@ -271,7 +283,7 @@
  
  	bool rd = buf_flags(bp) & B_READ;
  
-@@ -433,24 +651,24 @@
+@@ -433,24 +663,24 @@
  	lck_mtx_lock(&sweet_ufs_lock);
  	for (uint32_t done = 0; done < count;) {
  		uint64_t pos = off + done;
@@ -303,7 +315,7 @@
  			}
  		}
  		if (error) {
-@@ -490,10 +708,10 @@
+@@ -490,10 +720,10 @@
  		su.secsize = *f;
  		return 0;
  	case DKIOCGETPHYSICALBLOCKSIZE:
@@ -316,7 +328,7 @@
  		return 0;
  	case DKIOCISWRITABLE:
  		*f = su.writable;
-@@ -504,7 +722,7 @@
+@@ -504,7 +734,7 @@
  			return 0;
  		}
  		lck_mtx_lock(&sweet_ufs_lock);
@@ -325,7 +337,7 @@
  		lck_mtx_unlock(&sweet_ufs_lock);
  		return error;
  	}
-@@ -538,7 +756,8 @@
+@@ -538,7 +768,8 @@
  static int
  sweet_ufs_psize(__unused dev_t dev)
  {
@@ -335,7 +347,7 @@
  }
  
  static int
-@@ -592,10 +811,16 @@
+@@ -592,10 +823,19 @@
  	char want[64] = "userdata";
  	int error;
  
@@ -343,30 +355,46 @@
 -	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess ||
 -	    size < 2 * sizeof(uintptr_t)) {
 -		printf("SWEET UFS: no /sweet-ufs node in the device tree\n");
++	kprintf("SWEET STORAGE: sweet_ufs_init called\n");
 +	if (SecureDTLookupEntry(NULL, "/lavender-emmc", &node) == kSuccess &&
 +	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) == kSuccess &&
 +	    size >= 2 * sizeof(uintptr_t)) {
 +		su.is_emmc = true;
++		kprintf("SWEET STORAGE: /lavender-emmc node found reg=0x%lx size=0x%lx\n", (unsigned long)reg[0], (unsigned long)reg[1]);
 +	} else if (SecureDTLookupEntry(NULL, "/sweet-ufs", &node) == kSuccess &&
 +	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) == kSuccess &&
 +	    size >= 2 * sizeof(uintptr_t)) {
 +		su.is_emmc = false;
++		kprintf("SWEET STORAGE: /sweet-ufs node found reg=0x%lx size=0x%lx\n", (unsigned long)reg[0], (unsigned long)reg[1]);
 +	} else {
-+		printf("SWEET STORAGE: neither /lavender-emmc nor /sweet-ufs node found\n");
++		kprintf("SWEET STORAGE: neither /lavender-emmc nor /sweet-ufs node found\n");
  		return ENXIO;
  	}
  	PE_parse_boot_argn("ufsroot", want, sizeof(want));
-@@ -610,7 +835,7 @@
+@@ -608,25 +848,41 @@
+ 	su.wait = (wait == 1);
+ 
  	su.regs = ml_io_map(reg[0], reg[1]);
++	kprintf("SWEET STORAGE: regs mapped at va 0x%lx\n", (unsigned long)su.regs);
++	if (!su.regs) {
++		kprintf("SWEET STORAGE: ml_io_map failed\n");
++		return ENXIO;
++	}
  	if (kmem_alloc_contig(kernel_map, &su.dma, DMA_SIZE, PAGE_MASK, 0, 0,
  	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
 -		printf("SWEET UFS: no contiguous DMA memory\n");
-+		printf("SWEET STORAGE: no contiguous DMA memory\n");
++		kprintf("SWEET STORAGE: no contiguous DMA memory\n");
  		return ENOMEM;
  	}
  	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)su.dma);
-@@ -622,11 +847,18 @@
+ 	if (!pn) {
++		kprintf("SWEET STORAGE: pmap_find_phys failed\n");
+ 		return ENOMEM;
+ 	}
+ 	su.dma_pa = ptoa_64(pn);
+ 	su.lun = 0;
  	su.secsize = DEV_BSIZE;
++	kprintf("SWEET STORAGE: DMA va=0x%lx pa=0x%llx size=0x%x\n", (unsigned long)su.dma, (unsigned long long)su.dma_pa, DMA_SIZE);
  
  	lck_mtx_lock(&sweet_ufs_lock);
 -	error = ufs_take_over_host();
@@ -377,27 +405,65 @@
 +	if (su.is_emmc) {
 +		error = 0;
 +		uint32_t hctl = sdhc_rd(SDHC_HOST_CONTROL_1);
-+		hctl = (hctl & ~0x18) | 0x10;
++		hctl = (hctl & ~0x18) | 0x18;
 +		sdhc_wr(SDHC_HOST_CONTROL_1, hctl);
 +		sdhc_wr(SDHC_INT_STATUS, 0xffffffff);
++		kprintf("SWEET STORAGE: lavender eMMC 64-bit ADMA2 host control set (0x%02x)\n", hctl);
 +	} else {
 +		error = ufs_take_over_host();
 +		if (!error) {
 +			static const uint8_t tur[6] = { 0x00 };
++			/* The first command after the bootloader may report a unit attention. */
 +			for (int i = 0; i < 3 && (error = ufs_scsi(tur, sizeof(tur), 0, false)); i++) {
 +			}
  		}
  	}
  	if (!error) {
-@@ -651,8 +883,9 @@
+@@ -634,15 +890,18 @@
+ 	}
+ 	lck_mtx_unlock(&sweet_ufs_lock);
+ 	if (error) {
++		kprintf("SWEET STORAGE: partition find failed: %d\n", error);
+ 		return error;
+ 	}
+ 
+ 	su.bmajor = bdevsw_add(-1, &sweet_ufs_bdevsw);
+ 	if (su.bmajor < 0) {
++		kprintf("SWEET STORAGE: bdevsw_add failed\n");
+ 		return ENXIO;
+ 	}
+ 	su.cmajor = cdevsw_add_with_bdev(-1, &sweet_ufs_cdevsw, su.bmajor);
+ 	if (su.cmajor < 0) {
++		kprintf("SWEET STORAGE: cdevsw_add_with_bdev failed\n");
+ 		return ENXIO;
+ 	}
+ 	su.bdev = makedev(su.bmajor, 0);
+@@ -651,8 +910,9 @@
  	/* Only now, with the partition bounds known, can writes be allowed. */
  	su.writable = (rw != 0);
  	su.ready = true;
 -	printf("SWEET UFS: \"%s\" on LUN %u: first block 0x%llx, %llu MiB, %s, DMA at 0x%llx\n",
 -	    want, su.lun, su.first_block, su.nblocks * UFS_BLOCK >> 20,
 +	uint32_t dev_blk = su.is_emmc ? 512u : UFS_BLOCK;
-+	printf("SWEET %s: \"%s\": first block 0x%llx, %llu MiB, %s, DMA at 0x%llx\n",
++	kprintf("SWEET %s: \"%s\": first block 0x%llx, %llu MiB, %s, DMA at 0x%llx\n",
 +	    su.is_emmc ? "eMMC" : "UFS", want, su.first_block, su.nblocks * dev_blk >> 20,
  	    su.writable ? "read-write" : "read-only", su.dma_pa);
  	sweet_log_start();
  	sweet_sample_start();
+@@ -811,13 +1071,16 @@
+ int
+ sweet_ufs_rootdev(dev_t *dev)
+ {
++	kprintf("SWEET STORAGE: sweet_ufs_rootdev called\n");
+ 	if (!su.ready) {
+ 		int error = sweet_ufs_init();
+ 		if (error) {
++			kprintf("SWEET STORAGE: sweet_ufs_init failed: %d\n", error);
+ 			return error;
+ 		}
+ 	}
+ 	*dev = su.bdev;
++	kprintf("SWEET STORAGE: sweet_ufs_rootdev ready dev=0x%x\n", *dev);
+ 	return 0;
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
