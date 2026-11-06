@@ -11,7 +11,7 @@
  	bool writable;                          /* boot-arg ufsrw=1 */
  	bool cache;                             /* boot-arg ufscache=1 */
  	bool wait;                              /* boot-arg ufswait=1 */
-@@ -299,16 +300,243 @@
+@@ -299,16 +300,248 @@
  	return ufs_scsi(cdb, sizeof(cdb), 0, false);
  }
  
@@ -23,6 +23,8 @@
 +#define SDHC_PRESENT_STATE  0x24
 +#define SDHC_HOST_CONTROL_1 0x28
 +#define SDHC_INT_STATUS     0x30
++#define SDHC_HOST_CONTROL_2 0x3e
++#define SDHC_CAPABILITIES   0x40
 +#define SDHC_ADMA_ADDR      0x58
 +
 +struct adma2_desc {
@@ -30,7 +32,8 @@
 +	uint16_t len;
 +	uint32_t addr_lo;
 +	uint32_t addr_hi;
-+} __attribute__((packed, aligned(4)));
++	uint32_t reserved;
++} __attribute__((packed, aligned(8)));
 +
 +static inline uint32_t sdhc_rd(uint32_t off) {
 +	return *(volatile uint32_t *)(su.regs + off);
@@ -55,10 +58,9 @@
 +	deadline += mach_absolute_time();
 +	while (sdhc_rd(SDHC_PRESENT_STATE) & 3) {
 +		if (mach_absolute_time() > deadline) {
-+			kprintf("LAVENDER eMMC: command inhibit timeout\n");
++			kprintf("LAVENDER eMMC: command inhibit timeout pstate=0x%x\n", sdhc_rd(SDHC_PRESENT_STATE));
 +			return ETIMEDOUT;
 +		}
-+		delay(1);
 +	}
 +
 +	uint32_t hctl = sdhc_rd(SDHC_HOST_CONTROL_1);
@@ -71,7 +73,7 @@
 +	desc->addr_lo = (uint32_t)bounce_pa;
 +	desc->addr_hi = (uint32_t)(bounce_pa >> 32);
 +
-+	dma_sync(DMA_UTRL, sizeof(*desc));
++	dma_clean(DMA_UTRL, sizeof(*desc));
 +	dma_sync(DMA_BOUNCE, bytes);
 +	__builtin_arm_dsb(0xf);
 +
@@ -90,7 +92,7 @@
 +		sdhc_wr16(SDHC_COMMAND, (18 << 8) | 0x3a);
 +	}
 +
-+	nanoseconds_to_absolutetime(CMD_TIMEOUT_NS, &deadline);
++	nanoseconds_to_absolutetime(2ull * NSEC_PER_SEC, &deadline);
 +	deadline += mach_absolute_time();
 +	uint32_t istat = 0;
 +	while (1) {
@@ -100,15 +102,16 @@
 +		}
 +		if (istat & 0x8000) {
 +			sdhc_wr(SDHC_INT_STATUS, 0xffffffff);
-+			kprintf("LAVENDER eMMC: read error istat 0x%08x LBA 0x%llx count %u\n", istat, lba, count);
++			kprintf("LAVENDER eMMC: read error istat 0x%08x LBA 0x%llx count %u pstate 0x%08x\n",
++				istat, lba, count, sdhc_rd(SDHC_PRESENT_STATE));
 +			return EIO;
 +		}
 +		if (mach_absolute_time() > deadline) {
 +			sdhc_wr(SDHC_INT_STATUS, 0xffffffff);
-+			kprintf("LAVENDER eMMC: read timeout LBA 0x%llx count %u istat 0x%x\n", lba, count, istat);
++			kprintf("LAVENDER eMMC: read timeout LBA 0x%llx count %u istat 0x%x pstate 0x%x\n",
++				lba, count, istat, sdhc_rd(SDHC_PRESENT_STATE));
 +			return ETIMEDOUT;
 +		}
-+		delay(1);
 +	}
 +	sdhc_wr(SDHC_INT_STATUS, 0xffffffff);
 +	dma_sync(DMA_BOUNCE, bytes);
@@ -145,10 +148,9 @@
 +	deadline += mach_absolute_time();
 +	while (sdhc_rd(SDHC_PRESENT_STATE) & 3) {
 +		if (mach_absolute_time() > deadline) {
-+			kprintf("LAVENDER eMMC: write inhibit timeout\n");
++			kprintf("LAVENDER eMMC: write inhibit timeout pstate=0x%x\n", sdhc_rd(SDHC_PRESENT_STATE));
 +			return ETIMEDOUT;
 +		}
-+		delay(1);
 +	}
 +
 +	uint32_t hctl = sdhc_rd(SDHC_HOST_CONTROL_1);
@@ -180,7 +182,7 @@
 +		sdhc_wr16(SDHC_COMMAND, (25 << 8) | 0x3a);
 +	}
 +
-+	nanoseconds_to_absolutetime(CMD_TIMEOUT_NS, &deadline);
++	nanoseconds_to_absolutetime(2ull * NSEC_PER_SEC, &deadline);
 +	deadline += mach_absolute_time();
 +	uint32_t istat = 0;
 +	while (1) {
@@ -190,15 +192,16 @@
 +		}
 +		if (istat & 0x8000) {
 +			sdhc_wr(SDHC_INT_STATUS, 0xffffffff);
-+			kprintf("LAVENDER eMMC: write error istat 0x%08x LBA 0x%llx count %u\n", istat, lba, count);
++			kprintf("LAVENDER eMMC: write error istat 0x%08x LBA 0x%llx count %u pstate 0x%08x\n",
++				istat, lba, count, sdhc_rd(SDHC_PRESENT_STATE));
 +			return EIO;
 +		}
 +		if (mach_absolute_time() > deadline) {
 +			sdhc_wr(SDHC_INT_STATUS, 0xffffffff);
-+			kprintf("LAVENDER eMMC: write timeout LBA 0x%llx count %u istat 0x%x\n", lba, count, istat);
++			kprintf("LAVENDER eMMC: write timeout LBA 0x%llx count %u istat 0x%x pstate 0x%x\n",
++				lba, count, istat, sdhc_rd(SDHC_PRESENT_STATE));
 +			return ETIMEDOUT;
 +		}
-+		delay(1);
 +	}
 +	sdhc_wr(SDHC_INT_STATUS, 0xffffffff);
 +	return 0;
@@ -251,13 +254,15 @@
 +		kprintf("SWEET STORAGE: read LBA 1 failed: %d\n", error);
  		return error;
  	}
++	kprintf("SWEET STORAGE: LBA 1 read OK, sig='%c%c%c%c%c%c%c%c'\n",
++		b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]);
  	if (memcmp(b, "EFI PART", 8) != 0) {
 -		printf("SWEET UFS: LUN %u has no GPT\n", su.lun);
 +		kprintf("SWEET STORAGE: disk has no GPT\n");
  		return ENXIO;
  	}
  	uint64_t entry_lba;
-@@ -317,10 +545,11 @@
+@@ -317,11 +550,13 @@
  	memcpy(&nent, b + 80, 4);
  	memcpy(&esz, b + 84, 4);
  	if (esz != 128 || nent == 0 || nent * esz > BOUNCE_SIZE) {
@@ -269,9 +274,28 @@
 +	kprintf("SWEET STORAGE: GPT valid, %u entries at LBA 0x%llx\n", nent, entry_lba);
 +	error = dev_read_blocks(entry_lba, (nent * esz + dev_blk - 1) / dev_blk);
  	if (error) {
++		kprintf("SWEET STORAGE: read partition table failed: %d\n", error);
  		return error;
  	}
-@@ -407,9 +636,10 @@
+ 	for (uint32_t i = 0; i < nent; i++) {
+@@ -343,13 +578,15 @@
+ 		memcpy(&first, e + 32, 8);
+ 		memcpy(&last, e + 40, 8);
+ 		if (last < first) {
++			kprintf("SWEET STORAGE: corrupt partition '%s': last < first\n", want);
+ 			return ENXIO;
+ 		}
+ 		su.first_block = first;
+ 		su.nblocks = last - first + 1;
++		kprintf("SWEET STORAGE: matched '%s' at LBA 0x%llx (%llu MB)\n", want, su.first_block, (su.nblocks * dev_blk) >> 20);
+ 		return 0;
+ 	}
+-	printf("SWEET UFS: no GPT partition named \"%s\"\n", want);
++	kprintf("SWEET STORAGE: partition '%s' not found in GPT\n", want);
+ 	return ENOENT;
+ }
+ 
+@@ -407,9 +644,10 @@
  {
  	int error = 0;
  	caddr_t vaddr = NULL;
@@ -283,7 +307,7 @@
  
  	bool rd = buf_flags(bp) & B_READ;
  
-@@ -433,24 +663,24 @@
+@@ -433,24 +671,24 @@
  	lck_mtx_lock(&sweet_ufs_lock);
  	for (uint32_t done = 0; done < count;) {
  		uint64_t pos = off + done;
@@ -315,7 +339,7 @@
  			}
  		}
  		if (error) {
-@@ -490,10 +720,10 @@
+@@ -490,10 +728,10 @@
  		su.secsize = *f;
  		return 0;
  	case DKIOCGETPHYSICALBLOCKSIZE:
@@ -328,7 +352,7 @@
  		return 0;
  	case DKIOCISWRITABLE:
  		*f = su.writable;
-@@ -504,7 +734,7 @@
+@@ -504,7 +742,7 @@
  			return 0;
  		}
  		lck_mtx_lock(&sweet_ufs_lock);
@@ -337,7 +361,7 @@
  		lck_mtx_unlock(&sweet_ufs_lock);
  		return error;
  	}
-@@ -538,7 +768,8 @@
+@@ -538,7 +776,8 @@
  static int
  sweet_ufs_psize(__unused dev_t dev)
  {
@@ -347,7 +371,7 @@
  }
  
  static int
-@@ -592,10 +823,19 @@
+@@ -592,10 +831,19 @@
  	char want[64] = "userdata";
  	int error;
  
@@ -371,7 +395,7 @@
  		return ENXIO;
  	}
  	PE_parse_boot_argn("ufsroot", want, sizeof(want));
-@@ -608,25 +848,41 @@
+@@ -608,25 +856,42 @@
  	su.wait = (wait == 1);
  
  	su.regs = ml_io_map(reg[0], reg[1]);
@@ -408,7 +432,8 @@
 +		hctl = (hctl & ~0x18) | 0x18;
 +		sdhc_wr(SDHC_HOST_CONTROL_1, hctl);
 +		sdhc_wr(SDHC_INT_STATUS, 0xffffffff);
-+		kprintf("SWEET STORAGE: lavender eMMC 64-bit ADMA2 host control set (0x%02x)\n", hctl);
++		kprintf("SWEET STORAGE: lavender eMMC hctl1=0x%x hctl2=0x%x cap=0x%x 0x%x\n",
++			hctl, sdhc_rd(SDHC_HOST_CONTROL_2) & 0xffff, sdhc_rd(SDHC_CAPABILITIES), sdhc_rd(SDHC_CAPABILITIES + 4));
 +	} else {
 +		error = ufs_take_over_host();
 +		if (!error) {
@@ -419,7 +444,7 @@
  		}
  	}
  	if (!error) {
-@@ -634,15 +890,18 @@
+@@ -634,15 +899,18 @@
  	}
  	lck_mtx_unlock(&sweet_ufs_lock);
  	if (error) {
@@ -438,7 +463,7 @@
  		return ENXIO;
  	}
  	su.bdev = makedev(su.bmajor, 0);
-@@ -651,8 +910,9 @@
+@@ -651,8 +919,9 @@
  	/* Only now, with the partition bounds known, can writes be allowed. */
  	su.writable = (rw != 0);
  	su.ready = true;
@@ -450,7 +475,7 @@
  	    su.writable ? "read-write" : "read-only", su.dma_pa);
  	sweet_log_start();
  	sweet_sample_start();
-@@ -811,13 +1071,16 @@
+@@ -811,13 +1080,16 @@
  int
  sweet_ufs_rootdev(dev_t *dev)
  {
