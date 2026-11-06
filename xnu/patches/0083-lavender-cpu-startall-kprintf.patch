@@ -1,6 +1,6 @@
 --- a/osfmk/arm/cpu_common.c
 +++ b/osfmk/arm/cpu_common.c
-@@ -976,6 +976,17 @@
+@@ -976,7 +976,18 @@
  	cpu_data_t *cdp = CpuDataEntries[cpu].cpu_data_vaddr;
  	return cdp != NULL && !(os_atomic_load(&cdp->cpu_signal, acquire) & SIGPdisabled);
  }
@@ -54,7 +54,7 @@
 +		IODelay(100);
  	}
  	/* The supplied ADT has cpu0 as the boot CPU and ascending A55 nodes. */
-@@ -152,23 +153,28 @@
+@@ -152,27 +153,32 @@
  		SweetCPU *cpu = __atomic_load_n(&sweet_cpus[i], __ATOMIC_ACQUIRE);
  		kern_return_t kr = processor_start(cpu->machProcessor);
  		if (kr != KERN_SUCCESS) {
@@ -94,7 +94,7 @@
  	thread_terminate(current_thread());
 --- a/iokit/bsddev/IOKitBSDInit.cpp
 +++ b/iokit/bsddev/IOKitBSDInit.cpp
-@@ -771,11 +771,13 @@
+@@ -771,13 +771,14 @@
  //
  	if (strcmp(rdBootVar, "ufsroot0") == 0) {
  		extern int sweet_ufs_rootdev(dev_t *dev);
@@ -122,7 +122,7 @@
  	    su.is_emmc ? "eMMC" : "UFS", want, su.first_block, su.nblocks * dev_blk >> 20,
  	    su.writable ? "read-write" : "read-only", su.dma_pa);
  	sweet_log_start();
-@@ -908,10 +908,13 @@
+@@ -908,12 +908,15 @@
  int
  sweet_ufs_rootdev(dev_t *dev)
  {
