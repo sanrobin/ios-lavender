@@ -1,0 +1,403 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -104,8 +104,9 @@
+ 	uint64_t dma_pa;
+ 	uint8_t lun;
+ 	uint8_t tag;
+-	uint64_t first_block, nblocks;          /* partition, in 4 KiB device blocks */
++	uint64_t first_block, nblocks;          /* partition, in device blocks */
+ 	uint32_t secsize;                       /* logical sector size for the BSD layer */
++	bool is_emmc;                           /* true if lavender eMMC (sdhci@c0c4000) */
+ 	bool writable;                          /* boot-arg ufsrw=1 */
+ 	bool cache;                             /* boot-arg ufscache=1 */
+ 	bool wait;                              /* boot-arg ufswait=1 */
+@@ -299,16 +300,232 @@
+ 	return ufs_scsi(cdb, sizeof(cdb), 0, false);
+ }
+ 
++
++#define SDHC_BLOCK_SIZE     0x04
++#define SDHC_BLOCK_COUNT    0x06
++#define SDHC_ARGUMENT       0x08
++#define SDHC_TRANSFER_MODE  0x0c
++#define SDHC_COMMAND        0x0e
++#define SDHC_PRESENT_STATE  0x24
++#define SDHC_HOST_CONTROL_1 0x28
++#define SDHC_INT_STATUS     0x30
++#define SDHC_ADMA_ADDR      0x58
++
++struct adma2_desc {
++	uint16_t cmd;
++	uint16_t len;
++	uint32_t addr;
++} __attribute__((packed, aligned(8)));
++
++static inline uint32_t sdhc_rd(uint32_t off) {
++	return *(volatile uint32_t *)(su.regs + off);
++}
++static inline void sdhc_wr(uint32_t off, uint32_t v) {
++	*(volatile uint32_t *)(su.regs + off) = v;
++}
++static inline void sdhc_wr16(uint32_t off, uint16_t v) {
++	*(volatile uint16_t *)(su.regs + off) = v;
++}
++
++static int
++emmc_read_chunk(uint64_t lba, uint32_t count)
++{
++	struct adma2_desc *desc = (struct adma2_desc *)(su.dma + DMA_UTRL);
++	uint64_t desc_pa = su.dma_pa + DMA_UTRL;
++	uint64_t bounce_pa = su.dma_pa + DMA_BOUNCE;
++	uint32_t bytes = count * 512;
++
++	uint64_t deadline;
++	nanoseconds_to_absolutetime(100ull * NSEC_PER_MSEC, &deadline);
++	deadline += mach_absolute_time();
++	while (sdhc_rd(SDHC_PRESENT_STATE) & 3) {
++		if (mach_absolute_time() > deadline) {
++			printf("LAVENDER eMMC: command inhibit timeout\n");
++			return ETIMEDOUT;
++		}
++		delay(1);
++	}
++
++	uint32_t hctl = sdhc_rd(SDHC_HOST_CONTROL_1);
++	hctl = (hctl & ~0x18) | 0x10;
++	sdhc_wr(SDHC_HOST_CONTROL_1, hctl);
++
++	desc->cmd = 0x0023;
++	desc->len = (uint16_t)bytes;
++	desc->addr = (uint32_t)bounce_pa;
++
++	dma_sync(DMA_UTRL, sizeof(*desc));
++	dma_sync(DMA_BOUNCE, bytes);
++	__builtin_arm_dsb(0xf);
++
++	sdhc_wr(SDHC_INT_STATUS, 0xffffffff);
++	sdhc_wr(SDHC_ADMA_ADDR, (uint32_t)desc_pa);
++	sdhc_wr16(SDHC_BLOCK_SIZE, 512);
++	sdhc_wr16(SDHC_BLOCK_COUNT, (uint16_t)count);
++	sdhc_wr(SDHC_ARGUMENT, (uint32_t)lba);
++
++	if (count == 1) {
++		sdhc_wr16(SDHC_TRANSFER_MODE, 0x0011);
++		sdhc_wr16(SDHC_COMMAND, (17 << 8) | 0x3a);
++	} else {
++		sdhc_wr16(SDHC_TRANSFER_MODE, 0x0037);
++		sdhc_wr16(SDHC_COMMAND, (18 << 8) | 0x3a);
++	}
++
++	nanoseconds_to_absolutetime(CMD_TIMEOUT_NS, &deadline);
++	deadline += mach_absolute_time();
++	uint32_t istat = 0;
++	while (1) {
++		istat = sdhc_rd(SDHC_INT_STATUS);
++		if (istat & 2) {
++			break;
++		}
++		if (istat & 0x8000) {
++			sdhc_wr(SDHC_INT_STATUS, 0xffffffff);
++			printf("LAVENDER eMMC: read error istat 0x%08x\n", istat);
++			return EIO;
++		}
++		if (mach_absolute_time() > deadline) {
++			sdhc_wr(SDHC_INT_STATUS, 0xffffffff);
++			printf("LAVENDER eMMC: read timeout LBA 0x%llx count %u istat 0x%x\n", lba, count, istat);
++			return ETIMEDOUT;
++		}
++		delay(1);
++	}
++	sdhc_wr(SDHC_INT_STATUS, 0xffffffff);
++	dma_sync(DMA_BOUNCE, bytes);
++	return 0;
++}
++
++static int
++emmc_read_blocks(uint64_t lba, uint32_t count)
++{
++	if (lba > UINT32_MAX || count == 0 || count * 512 > BOUNCE_SIZE) {
++		return EINVAL;
++	}
++	for (uint32_t done = 0; done < count;) {
++		uint32_t chunk = MIN(count - done, 64);
++		int error = emmc_read_chunk(lba + done, chunk);
++		if (error) {
++			return error;
++		}
++		done += chunk;
++	}
++	return 0;
++}
++
++static int
++emmc_write_chunk(uint64_t lba, uint32_t count)
++{
++	struct adma2_desc *desc = (struct adma2_desc *)(su.dma + DMA_UTRL);
++	uint64_t desc_pa = su.dma_pa + DMA_UTRL;
++	uint64_t bounce_pa = su.dma_pa + DMA_BOUNCE;
++	uint32_t bytes = count * 512;
++
++	uint64_t deadline;
++	nanoseconds_to_absolutetime(100ull * NSEC_PER_MSEC, &deadline);
++	deadline += mach_absolute_time();
++	while (sdhc_rd(SDHC_PRESENT_STATE) & 3) {
++		if (mach_absolute_time() > deadline) {
++			return ETIMEDOUT;
++		}
++		delay(1);
++	}
++
++	uint32_t hctl = sdhc_rd(SDHC_HOST_CONTROL_1);
++	hctl = (hctl & ~0x18) | 0x10;
++	sdhc_wr(SDHC_HOST_CONTROL_1, hctl);
++
++	desc->cmd = 0x0023;
++	desc->len = (uint16_t)bytes;
++	desc->addr = (uint32_t)bounce_pa;
++
++	dma_clean(DMA_UTRL, sizeof(*desc));
++	dma_clean(DMA_BOUNCE, bytes);
++	__builtin_arm_dsb(0xf);
++
++	sdhc_wr(SDHC_INT_STATUS, 0xffffffff);
++	sdhc_wr(SDHC_ADMA_ADDR, (uint32_t)desc_pa);
++	sdhc_wr16(SDHC_BLOCK_SIZE, 512);
++	sdhc_wr16(SDHC_BLOCK_COUNT, (uint16_t)count);
++	sdhc_wr(SDHC_ARGUMENT, (uint32_t)lba);
++
++	if (count == 1) {
++		sdhc_wr16(SDHC_TRANSFER_MODE, 0x0001);
++		sdhc_wr16(SDHC_COMMAND, (24 << 8) | 0x3a);
++	} else {
++		sdhc_wr16(SDHC_TRANSFER_MODE, 0x0027);
++		sdhc_wr16(SDHC_COMMAND, (25 << 8) | 0x3a);
++	}
++
++	nanoseconds_to_absolutetime(CMD_TIMEOUT_NS, &deadline);
++	deadline += mach_absolute_time();
++	uint32_t istat = 0;
++	while (1) {
++		istat = sdhc_rd(SDHC_INT_STATUS);
++		if (istat & 2) {
++			break;
++		}
++		if (istat & 0x8000) {
++			sdhc_wr(SDHC_INT_STATUS, 0xffffffff);
++			return EIO;
++		}
++		if (mach_absolute_time() > deadline) {
++			sdhc_wr(SDHC_INT_STATUS, 0xffffffff);
++			return ETIMEDOUT;
++		}
++		delay(1);
++	}
++	sdhc_wr(SDHC_INT_STATUS, 0xffffffff);
++	return 0;
++}
++
++static int
++emmc_write_blocks(uint64_t lba, uint32_t count)
++{
++	if (!su.writable || !su.nblocks || count == 0 || count * 512 > BOUNCE_SIZE ||
++	    lba < su.first_block || lba - su.first_block >= su.nblocks ||
++	    count > su.nblocks - (lba - su.first_block) || lba + count - 1 > UINT32_MAX) {
++		printf("LAVENDER eMMC: refusing write of %u blocks at 0x%llx\n", count, lba);
++		return EPERM;
++	}
++	for (uint32_t done = 0; done < count;) {
++		uint32_t chunk = MIN(count - done, 64);
++		int error = emmc_write_chunk(lba + done, chunk);
++		if (error) {
++			return error;
++		}
++		done += chunk;
++	}
++	return 0;
++}
++
++static inline int dev_read_blocks(uint64_t lba, uint32_t count)
++{
++	return su.is_emmc ? emmc_read_blocks(lba, count) : ufs_read_blocks(lba, count);
++}
++
++static inline int dev_write_blocks(uint64_t lba, uint32_t count)
++{
++	return su.is_emmc ? emmc_write_blocks(lba, count) : ufs_write_blocks(lba, count);
++}
++
++static inline int dev_sync_cache(void)
++{
++	return su.is_emmc ? 0 : ufs_sync_cache();
++}
++
+ static int
+ ufs_find_partition(const char *want)
+ {
++	uint32_t dev_blk = su.is_emmc ? 512u : UFS_BLOCK;
+ 	const uint8_t *b = (const uint8_t *)(su.dma + DMA_BOUNCE);
+-	int error = ufs_read_blocks(1, 1);
++	int error = dev_read_blocks(1, 1);
+ 	if (error) {
+ 		return error;
+ 	}
+ 	if (memcmp(b, "EFI PART", 8) != 0) {
+-		printf("SWEET UFS: LUN %u has no GPT\n", su.lun);
++		printf("SWEET STORAGE: disk has no GPT\n");
+ 		return ENXIO;
+ 	}
+ 	uint64_t entry_lba;
+@@ -317,10 +534,10 @@
+ 	memcpy(&nent, b + 80, 4);
+ 	memcpy(&esz, b + 84, 4);
+ 	if (esz != 128 || nent == 0 || nent * esz > BOUNCE_SIZE) {
+-		printf("SWEET UFS: unsupported GPT entries %u x %u\n", nent, esz);
++		printf("SWEET STORAGE: unsupported GPT entries %u x %u\n", nent, esz);
+ 		return ENXIO;
+ 	}
+-	error = ufs_read_blocks(entry_lba, (nent * esz + UFS_BLOCK - 1) / UFS_BLOCK);
++	error = dev_read_blocks(entry_lba, (nent * esz + dev_blk - 1) / dev_blk);
+ 	if (error) {
+ 		return error;
+ 	}
+@@ -407,9 +624,10 @@
+ {
+ 	int error = 0;
+ 	caddr_t vaddr = NULL;
++	uint32_t dev_blk = su.is_emmc ? 512u : UFS_BLOCK;
+ 	uint64_t off = (uint64_t)buf_blkno(bp) * su.secsize;
+ 	uint32_t count = buf_count(bp);
+-	uint64_t part_bytes = su.nblocks * UFS_BLOCK;
++	uint64_t part_bytes = su.nblocks * dev_blk;
+ 
+ 	bool rd = buf_flags(bp) & B_READ;
+ 
+@@ -433,24 +651,24 @@
+ 	lck_mtx_lock(&sweet_ufs_lock);
+ 	for (uint32_t done = 0; done < count;) {
+ 		uint64_t pos = off + done;
+-		uint64_t lba = pos / UFS_BLOCK;
+-		uint32_t skip = (uint32_t)(pos % UFS_BLOCK);
++		uint64_t lba = pos / dev_blk;
++		uint32_t skip = (uint32_t)(pos % dev_blk);
+ 		uint32_t want = MIN(count - done, BOUNCE_SIZE - skip);
+-		uint32_t blocks = (skip + want + UFS_BLOCK - 1) / UFS_BLOCK;
++		uint32_t blocks = (skip + want + dev_blk - 1) / dev_blk;
+ 		void *bounce = (void *)(su.dma + DMA_BOUNCE);
+ 		if (rd) {
+-			error = ufs_read_blocks(su.first_block + lba, blocks);
++			error = dev_read_blocks(su.first_block + lba, blocks);
+ 			if (!error) {
+ 				memcpy(vaddr + done, (const char *)bounce + skip, want);
+ 			}
+ 		} else {
+ 			/* Partial device blocks at either end: read, merge, write back. */
+-			if (skip || (want % UFS_BLOCK)) {
+-				error = ufs_read_blocks(su.first_block + lba, blocks);
++			if (skip || (want % dev_blk)) {
++				error = dev_read_blocks(su.first_block + lba, blocks);
+ 			}
+ 			if (!error) {
+ 				memcpy((char *)bounce + skip, vaddr + done, want);
+-				error = ufs_write_blocks(su.first_block + lba, blocks);
++				error = dev_write_blocks(su.first_block + lba, blocks);
+ 			}
+ 		}
+ 		if (error) {
+@@ -490,10 +708,10 @@
+ 		su.secsize = *f;
+ 		return 0;
+ 	case DKIOCGETPHYSICALBLOCKSIZE:
+-		*f = UFS_BLOCK;
++		*f = su.is_emmc ? 512u : UFS_BLOCK;
+ 		return 0;
+ 	case DKIOCGETBLOCKCOUNT:
+-		*o = su.nblocks * UFS_BLOCK / su.secsize;
++		*o = su.nblocks * (su.is_emmc ? 512u : UFS_BLOCK) / su.secsize;
+ 		return 0;
+ 	case DKIOCISWRITABLE:
+ 		*f = su.writable;
+@@ -504,7 +722,7 @@
+ 			return 0;
+ 		}
+ 		lck_mtx_lock(&sweet_ufs_lock);
+-		int error = ufs_sync_cache();
++		int error = dev_sync_cache();
+ 		lck_mtx_unlock(&sweet_ufs_lock);
+ 		return error;
+ 	}
+@@ -538,7 +756,8 @@
+ static int
+ sweet_ufs_psize(__unused dev_t dev)
+ {
+-	return su.ready ? (int)MIN(su.nblocks * UFS_BLOCK / su.secsize, INT_MAX) : -1;
++	uint32_t dev_blk = su.is_emmc ? 512u : UFS_BLOCK;
++	return su.ready ? (int)MIN(su.nblocks * dev_blk / su.secsize, INT_MAX) : -1;
+ }
+ 
+ static int
+@@ -592,10 +811,16 @@
+ 	char want[64] = "userdata";
+ 	int error;
+ 
+-	if (SecureDTLookupEntry(NULL, "/sweet-ufs", &node) != kSuccess ||
+-	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess ||
+-	    size < 2 * sizeof(uintptr_t)) {
+-		printf("SWEET UFS: no /sweet-ufs node in the device tree\n");
++	if (SecureDTLookupEntry(NULL, "/lavender-emmc", &node) == kSuccess &&
++	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) == kSuccess &&
++	    size >= 2 * sizeof(uintptr_t)) {
++		su.is_emmc = true;
++	} else if (SecureDTLookupEntry(NULL, "/sweet-ufs", &node) == kSuccess &&
++	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) == kSuccess &&
++	    size >= 2 * sizeof(uintptr_t)) {
++		su.is_emmc = false;
++	} else {
++		printf("SWEET STORAGE: neither /lavender-emmc nor /sweet-ufs node found\n");
+ 		return ENXIO;
+ 	}
+ 	PE_parse_boot_argn("ufsroot", want, sizeof(want));
+@@ -610,7 +835,7 @@
+ 	su.regs = ml_io_map(reg[0], reg[1]);
+ 	if (kmem_alloc_contig(kernel_map, &su.dma, DMA_SIZE, PAGE_MASK, 0, 0,
+ 	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+-		printf("SWEET UFS: no contiguous DMA memory\n");
++		printf("SWEET STORAGE: no contiguous DMA memory\n");
+ 		return ENOMEM;
+ 	}
+ 	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)su.dma);
+@@ -622,11 +847,18 @@
+ 	su.secsize = DEV_BSIZE;
+ 
+ 	lck_mtx_lock(&sweet_ufs_lock);
+-	error = ufs_take_over_host();
+-	if (!error) {
+-		static const uint8_t tur[6] = { 0x00 };
+-		/* The first command after the bootloader may report a unit attention. */
+-		for (int i = 0; i < 3 && (error = ufs_scsi(tur, sizeof(tur), 0, false)); i++) {
++	if (su.is_emmc) {
++		error = 0;
++		uint32_t hctl = sdhc_rd(SDHC_HOST_CONTROL_1);
++		hctl = (hctl & ~0x18) | 0x10;
++		sdhc_wr(SDHC_HOST_CONTROL_1, hctl);
++		sdhc_wr(SDHC_INT_STATUS, 0xffffffff);
++	} else {
++		error = ufs_take_over_host();
++		if (!error) {
++			static const uint8_t tur[6] = { 0x00 };
++			for (int i = 0; i < 3 && (error = ufs_scsi(tur, sizeof(tur), 0, false)); i++) {
++			}
+ 		}
+ 	}
+ 	if (!error) {
+@@ -651,8 +883,9 @@
+ 	/* Only now, with the partition bounds known, can writes be allowed. */
+ 	su.writable = (rw != 0);
+ 	su.ready = true;
+-	printf("SWEET UFS: \"%s\" on LUN %u: first block 0x%llx, %llu MiB, %s, DMA at 0x%llx\n",
+-	    want, su.lun, su.first_block, su.nblocks * UFS_BLOCK >> 20,
++	uint32_t dev_blk = su.is_emmc ? 512u : UFS_BLOCK;
++	printf("SWEET %s: \"%s\": first block 0x%llx, %llu MiB, %s, DMA at 0x%llx\n",
++	    su.is_emmc ? "eMMC" : "UFS", want, su.first_block, su.nblocks * dev_blk >> 20,
+ 	    su.writable ? "read-write" : "read-only", su.dma_pa);
+ 	sweet_log_start();
+ 	sweet_sample_start();
