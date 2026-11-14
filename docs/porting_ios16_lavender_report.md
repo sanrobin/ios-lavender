@@ -5914,6 +5914,38 @@ Applied via [`apply_milestone83_kprintf_telemetry.py`](file:///C:/Users/Phoenix/
 - Booted to physical silicon (`101b8b08`) via `fastboot boot`.
 - Synchronized repository to GitHub (`https://github.com/sanrobin/ios-lavender.git`, commit `3472955`).
 
+---
+
+## 50. Milestone 84: Accurate kprintf Routing & Direct-to-Glass Process Telemetry
+
+### 50.1 Diagnostic Abort Post-Mortem
+During Milestone 83 testing on physical hardware (`101b8b08`), the kernel panicked with:
+```text
+panic(cpu 0 caller 0xfffffe0007ab718c): Kernel data abort. at pc 0xfffffe000780957c, lr 0xfffffe00078090fc
+  x0: 0x0000000000000073
+  far: 0x0000000000000073
+```
+- **Disassembly Analysis**:
+  - `0xfffffe000780957c` was not `kprintf`, but `_ubc_cs_blob_add` in `bsd/kern/ubc_subr.c`. It treated `x0` as `struct vnode *vp` and attempted `ldr x8, [x0]`.
+  - Because `x0` held `0x73` (ASCII `'s'`), it triggered a data abort at address `0x73`.
+  - Disassembly of `sweet_ufs_rootdev` (`0xfffffe0007498bf4`) pinpointed the authentic low-level `kprintf` function at:
+    $$\mathbf{kprintf = 0xfffffe0007a55c60} \quad (\text{file offset } \texttt{0xa51c60})$$
+  - `kprintf` conforms to Darwin ARM64 variadic stack parameter conventions, loading arguments from caller `[sp]`.
+
+### 50.2 Remediation via Milestone 84
+Applied via [`apply_milestone84_kprintf_fix.py`](file:///C:/Users/Phoenix/Documents/ios-rn7/apply_milestone84_kprintf_fix.py):
+1. **Sampler Title**: `0x496ad0` $\to$ `str x24, [sp]`; `0x496ad8` $\to$ `bl #0xfffffe0007a55c60`.
+2. **Sampler Task Header**: `0x2bed8c` $\to$ `bl #0xfffffe0007a55c60`.
+3. **Sampler Backtrace Line**: `0x2bedc8` $\to$ `str x19, [sp]`; `0x2bedd4` $\to$ `bl #0xfffffe0007a55c60`.
+4. **Universal Execve Logger**: `0x7a8bc8` $\to$ `str x8, [sp]`; `0x7a8bcc` $\to$ `bl #0xfffffe0007a55c60`.
+5. **Immediate Sample 0 & 2-Second Universal Loop**: Preserved intact.
+
+### 50.3 Silicon Verification & Deployment
+- Rebuilt [`kernel-armv8/shim-boot.img`](file:///C:/Users/Phoenix/Documents/ios-rn7/kernel-armv8/shim-boot.img) (17,031,168 bytes, 0 LSE instructions).
+- Booted to physical device via `fastboot boot`.
+- Synced to GitHub: [`sanrobin/ios-lavender.git`](https://github.com/sanrobin/ios-lavender.git) (commit [`10d51c7`](https://github.com/sanrobin/ios-lavender/commit/10d51c7)).
+
+
 
 
 
