@@ -5872,6 +5872,49 @@ Applied via [`apply_milestone82_telemetry.py`](file:///C:/Users/Phoenix/Document
 - Rebuilt boot image $\to$ [`kernel-armv8/shim-boot.img`](file:///C:/Users/Phoenix/Documents/ios-rn7/kernel-armv8/shim-boot.img) (17,031,168 bytes, 16.24 MB).
 - Booted via `fastboot boot kernel-armv8/shim-boot.img` (Finished in 0.575s).
 
+---
+
+## 49. Milestone 83: Direct-to-Glass Framebuffer Console Telemetry, Zero-Delay Sampler & GitHub Synchronization
+
+### 49.1 Root Cause Analysis: The Silent Console Mystery
+Disassembly and architectural analysis of `xnu/patches/0003-sweet-framebuffer-serial-console.patch` and `bsd/kern/subr_prf.c` revealed why execution appeared completely silent following the 20th shared cache subcache mapping:
+1. **The Divergence of `printf` vs `kprintf` in SWEET**:
+   - On SWEET/Lavender hardware, the on-screen display (`sweet-fbcon`, physical address `0x9d400000`, 1080x2340 FHD+ IPS) is attached directly to XNU's low-level early serial engine (`SERIAL_SWEET_FBCON`).
+   - Only `kprintf` (`0xfffffe0007809870`, file offset `0x805870`) writes directly to `pe_serial` and draws character glyphs onto the framebuffer glass.
+   - Standard BSD `printf` (`0xfffffe00072e62d0`, file offset `0x2e22d0`) writes to the internal in-memory ring buffer (`msgbuf`) and routes to `/dev/console`. During early boot before userland window management or `syslogd` attaches to `/dev/console`, `printf` output never reaches the framebuffer glass.
+   - Consequently, all telemetry added in Milestone 82 (`sweet_sample_thread`, `sweet_sample_task`, and `kern_exec` process spawn logger) called `printf`, silently buffering their diagnostic text into RAM without displaying on glass.
+2. **The Initial Delay in `sweet_sample_thread`**:
+   - In `bsd/dev/sweet_sample.c`, `sweet_sample_thread` began with an initial sleep (`tsleep(&chan, PZERO, "sweetsmp", ...)`).
+   - Bypassing this delay ensures Sample 0 fires immediately upon storage initialization.
+3. **Filtering by Process Name**:
+   - `sweet_sample_proc` checked `sweet_sample_wanted(name)`. Bypassing this filter ensures every process in `PROC_ALLPROCLIST` (PID 1 `launchd`, kernel daemons, and all child tasks) is sampled unconditionally.
+
+### 49.2 Surgical Implementation & Direct-to-Glass Patches
+Applied via [`apply_milestone83_kprintf_telemetry.py`](file:///C:/Users/Phoenix/Documents/ios-rn7/apply_milestone83_kprintf_telemetry.py):
+1. **Zero-Delay Sampler**:
+   - File offset `0x496a80` (VA `0xfffffe000749aa80`): Patched to `b #0xfffffe000749aab4` (`0x1400000d`). Bypasses the initial sleep entirely, firing Sample 0 immediately upon storage initialization.
+2. **Sampler Title Routed to `kprintf`**:
+   - File offset `0x496ad0` (VA `0xfffffe000749aad0`): `mov x1, x24` (`0xaa1803e1`), passing sample count index in register `x1`.
+   - File offset `0x496ad8` (VA `0xfffffe000749aad8`): `bl #0xfffffe0007809870` (`0x940dbb66`), redirecting `printf("SMP --- sample %d\n", i)` directly to `kprintf` on glass.
+3. **Aggressive 2-Second Sampler Interval**:
+   - File offset `0x496af8` (VA `0xfffffe000749aaf8`): `mov w9, #2` (`0x52800049`), sampling active threads every 2 seconds.
+4. **Universal Process Sampling**:
+   - File offset `0x496b90` (VA `0xfffffe000749ab90`): `b #0xfffffe000749ac14` (`0x14000021`), bypassing name filtering so every task/process in `PROC_ALLPROCLIST` is sampled unconditionally.
+5. **Thread Backtrace Line Routed to `kprintf`**:
+   - File offset `0x2bedc8` (VA `0xfffffe00072c2dc8`): `mov x1, x19` (`0xaa1303e1`), passing the fully formatted backtrace line pointer in register `x1`.
+   - File offset `0x2bedd4` (VA `0xfffffe00072c2dd4`): `bl #0xfffffe0007809870` (`0x94151aa7`), redirecting `printf("%s\n", line)` directly to `kprintf` on glass.
+6. **Universal Execve / Spawn Logger Routed to `kprintf`**:
+   - File offset `0x7a89ac` (VA `0xfffffe00077ac9ac`): `b #0xfffffe00077ac9f0` (`0x14000011`), unconditionally logging every binary execution.
+   - File offset `0x7a8bc8` (VA `0xfffffe00077acbc8`): `mov x1, x8` (`0xaa0803e1`), passing binary name in register `x1`.
+   - File offset `0x7a8bcc` (VA `0xfffffe00077acbcc`): `bl #0xfffffe0007809870` (`0x94017329`), redirecting `printf("exec %s\n", name)` directly to `kprintf` on glass.
+
+### 49.3 Verification, Packaging & Deployment
+- Ran [`scan_lse.py`](file:///C:/Users/Phoenix/Documents/ios-rn7/scan_lse.py): Verified **0 LSE instructions** in `__text`.
+- Packaged [`kernel-armv8/shim-boot.img`](file:///C:/Users/Phoenix/Documents/ios-rn7/kernel-armv8/shim-boot.img) (17,031,168 bytes, 16.24 MB).
+- Booted to physical silicon (`101b8b08`) via `fastboot boot`.
+- Synchronized repository to GitHub (`https://github.com/sanrobin/ios-lavender.git`, commit `3472955`).
+
+
 
 
 
